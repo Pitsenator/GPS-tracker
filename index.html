@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Мини-трекер</title>
+<style>
+  body{font-family:sans-serif;margin:0;padding:12px;background:#111;color:#eee;text-align:center}
+  canvas{background:#1c1c1c;border:1px solid #444;border-radius:8px;width:100%;max-width:340px;aspect-ratio:1}
+  button{font-size:18px;padding:14px;margin:6px 4px;border:0;border-radius:10px;width:44%}
+  #rec{background:#c0392b;color:#fff} #back{background:#27ae60;color:#fff}
+  button.on{outline:3px solid #fff}
+  #info{min-height:3em;font-size:15px}
+</style>
+<canvas id="c" width="340" height="340"></canvas>
+<div id="info">Готов</div>
+<button id="rec">● Запись трека</button>
+<button id="back">↩ Возврат</button>
+
+<script>
+const TH = 25;          // порог схода с маршрута, м
+const MIN_STEP = 5;     // не писать точки ближе 5 м
+const MAX_ACC = 30;     // игнорировать сигнал хуже 30 м
+
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+const info = document.getElementById('info');
+let track = JSON.parse(localStorage.getItem('track') || '[]');
+let mode = 'idle', pos = null, watch = null, ac = null, lastBeep = 0, wl = null;
+
+function beep() {
+  if (!ac) return;
+  const o = ac.createOscillator(), v = ac.createGain();
+  o.frequency.value = 880; v.gain.value = 0.5;
+  o.connect(v); v.connect(ac.destination);
+  o.start(); o.stop(ac.currentTime + 0.4);
+  if (navigator.vibrate) navigator.vibrate(300);
+}
+
+function proj(p, o) {
+  const k = Math.PI / 180;
+  return [(p[1] - o[1]) * Math.cos(o[0] * k) * 111320, (p[0] - o[0]) * 110540];
+}
+function dist(a, b) {
+  const q = proj(b, a); return Math.hypot(q[0], q[1]);
+}
+function distToTrack(p) {
+  if (track.length === 1) return dist(p, track[0]);
+  let best = Infinity;
+  const P = [0, 0];
+  for (let i = 0; i < track.length - 1; i++) {
+    const a = proj(track[i], p), b = proj(track[i + 1], p);
+    const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
+    let t = l2 ? ((P[0] - a[0]) * dx + (P[1] - a[1]) * dy) / l2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    best = Math.min(best, Math.hypot(a[0] + t * dx, a[1] + t * dy));
+  }
+  return best;
+}
+
+function draw(off) {
+  const W = cv.width, H = cv.height, M = 20;
+  g.clearRect(0, 0, W, H);
+  const all = track.slice(); if (pos) all.push(pos);
+  if (!all.length) return;
+  const o = all[0], pts = all.map(p => proj(p, o));
+  let x0 = Math.min(...pts.map(p => p[0])), x1 = Math.max(...pts.map(p => p[0]));
+  let y0 = Math.min(...pts.map(p => p[1])), y1 = Math.max(...pts.map(p => p[1]));
+  const span = Math.max(x1 - x0, y1 - y0, 50);
+  const s = (W - 2 * M) / span;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const X = p => W / 2 + (p[0] - cx) * s, Y = p => H / 2 - (p[1] - cy) * s;
+  g.strokeStyle = '#f1c40f'; g.lineWidth = 3; g.beginPath();
+  track.forEach((t, i) => { const p = proj(t, o); i ? g.lineTo(X(p), Y(p)) : g.moveTo(X(p), Y(p)); });
+  g.stroke();
+  if (track.length) {
+    const st = proj(track[0], o); g.fillStyle = '#2ecc71';
+    g.beginPath(); g.arc(X(st), Y(st), 5, 0, 7); g.fill();
+  }
+  if (pos) {
+    const p = proj(pos, o);
+    g.fillStyle = off ? '#ff3b30' : '#3498db';
+    g.beginPath(); g.arc(X(p), Y(p), 7, 0, 7); g.fill();
+  }
+}
+
+function onPos(e) {
+  if (e.coords.accuracy > MAX_ACC) { info.textContent = 'Слабый сигнал: ±' + Math.round(e.coords.accuracy) + ' м'; return; }
+  pos = [e.coords.latitude, e.coords.longitude];
+  let off = false;
+  if (mode === 'rec') {
+    if (!track.length || dist(track[track.length - 1], pos) >= MIN_STEP) {
+      track.push(pos); localStorage.setItem('track', JSON.stringify(track));
+    }
+    info.textContent = 'Запись: точек ' + track.length;
+  } else if (mode === 'back') {
+    const d = distToTrack(pos); off = d > TH;
+    info.textContent = off ? '⚠ Сход с маршрута: ' + Math.round(d) + ' м' : 'По треку, отклонение ' + Math.round(d) + ' м';
+    if (off && Date.now() - lastBeep > 3000) { beep(); lastBeep = Date.now(); }
+  }
+  draw(off);
+}
+
+async function start(m) {
+  if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+  try { wl = await navigator.wakeLock.request('screen'); } catch (e) {}
+  if (m === 'rec') { track = []; localStorage.removeItem('track'); }
+  if (m === 'back' && track.length < 2) { info.textContent = 'Нет записанного трека'; return; }
+  mode = m;
+  if (watch === null) watch = navigator.geolocation.watchPosition(onPos,
+    err => info.textContent = 'GPS: ' + err.message, { enableHighAccuracy: true, maximumAge: 0 });
+  document.getElementById('rec').classList.toggle('on', m === 'rec');
+  document.getElementById('back').classList.toggle('on', m === 'back');
+}
+function stop() {
+  mode = 'idle';
+  if (watch !== null) navigator.geolocation.clearWatch(watch);
+  watch = null; if (wl) wl.release();
+  document.querySelectorAll('button').forEach(b => b.classList.remove('on'));
+  info.textContent = 'Остановлено. Точек в треке: ' + track.length;
+}
+
+document.getElementById('rec').onclick = () => mode === 'rec' ? stop() : start('rec');
+document.getElementById('back').onclick = () => mode === 'back' ? stop() : start('back');
+draw(false);
+</script>
+</html>
